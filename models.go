@@ -17,4 +17,5 @@ type TracedEvent struct {
 	Event       EventEntity
 	Traceparent string
 	Tracepart   string
+	Retries     int
 }

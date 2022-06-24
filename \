@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
@@ -17,14 +18,12 @@ type RabbitMQBatchPublisher struct {
 	confirms chan amqp.Confirmation
 	confrmwg sync.WaitGroup
 	retrych  chan TracedEvent
-	trachch  chan int
 	closing  bool
 	lgr      *zap.Logger
 }
 
 func (b *RabbitMQBatchPublisher) Open(
 	retrych chan TracedEvent,
-	trackch chan int,
 ) error {
 
 	// - setting up channels
@@ -52,7 +51,6 @@ func (b *RabbitMQBatchPublisher) Open(
 
 	// - setting up properties
 	b.retrych = retrych
-	b.trachch = trackch
 
 	go func() {
 		b.confrmwg.Add(1)
@@ -69,7 +67,6 @@ func (b *RabbitMQBatchPublisher) PublishBatch(evnts []TracedEvent) error {
 	for _, evnt := range evnts {
 		json, err := json.Marshal(evnt.Event)
 		if err != nil {
-			b.lgr.Error("error marshalling message", zap.Error(err))
 			return fmt.Errorf("error unmarshalling: %w", err)
 		}
 		sqno := b.ch.GetNextPublishSeqNo()
@@ -93,7 +90,10 @@ func (b *RabbitMQBatchPublisher) PublishBatch(evnts []TracedEvent) error {
 	return nil
 }
 
-func (b *RabbitMQBatchPublisher) Close() { 
+func (b *RabbitMQBatchPublisher) Close() {
+	for len(b.pendings) != 0 {
+		time.Sleep(100 * time.Millisecond)
+	}
 	b.ch.Close()
 	close(b.confirms)
 	b.confrmwg.Wait()
@@ -112,21 +112,14 @@ func (b *RabbitMQBatchPublisher) confirmHandler() {
 					zap.String("trcprnt", b.pendings[confirmed.DeliveryTag].Traceparent),
 					zap.String("tpart", b.pendings[confirmed.DeliveryTag].Tracepart),
 				)
-				go func () {
-					b.trachch <- -1
-				}()
 			} else {
-				failed := b.pendings[confirmed.DeliveryTag]
 				b.lgr.Warn(
 					"failed notification delivery",
-					zap.Int("retry", failed.Retries),
-					zap.String("trcprnt", failed.Traceparent),
-					zap.String("tpart", failed.Tracepart),
+					zap.Int("retry", b.pendings[confirmed.DeliveryTag].Retries),
+					zap.String("trcprnt", b.pendings[confirmed.DeliveryTag].Traceparent),
+					zap.String("tpart", b.pendings[confirmed.DeliveryTag].Tracepart),
 				)
-				// the channel may be filled
-				go func () {
-					b.retrych <- failed
-				}()
+				b.retrych <- b.pendings[confirmed.DeliveryTag]
 			}
 			delete(b.pendings, confirmed.DeliveryTag)
 		}

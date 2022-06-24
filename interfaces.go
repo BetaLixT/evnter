@@ -10,6 +10,7 @@ type INotificationObserver interface {
 }
 
 type IBatchPublisher interface {
-  PublishBatch([]TracedEvent)
+  PublishBatch([]TracedEvent) error
+  Open(retrych chan TracedEvent, trackch chan int) error
   Close()
 }

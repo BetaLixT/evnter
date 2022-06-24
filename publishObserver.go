@@ -4,38 +4,65 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 type PublishObserver struct {
-	publisher  IBatchPublisher
-  key        string
-	eventQueue chan TracedEvent
-	dispatch   *NotificationDispatch
-	processingWg sync.WaitGroup
+	publisher     IBatchPublisher
+	key           string
+	eventQueue    chan TracedEvent
+	retryQueue    chan TracedEvent
+	trackingQueue chan int
+	messageCount  int
+	dispatch      *NotificationDispatch
+	processingWg  sync.WaitGroup
+	lgr           *zap.Logger
+	optn          *PublishObserverOptions
+	stopping      bool
+	batch         []TracedEvent
 }
 
 var _ INotificationObserver = (*PublishObserver)(nil)
 
 func (obs *PublishObserver) Subscribe(
-  dispatch *NotificationDispatch,
+	dispatch *NotificationDispatch,
 ) (err error) {
-  if (dispatch != nil) {
-    obs.dispatch = dispatch
-    obs.eventQueue = make(chan TracedEvent)
-    go func() {
-      obs.processingWg.Add(1)
-      obs.processQueue()
-      obs.processingWg.Done()
-    }()
-	  obs.dispatch.Subscribe(obs.key, obs)
-  } else {
-    err = fmt.Errorf("already subscribed")
-  }
-  return
+	if dispatch != nil {
+		obs.retryQueue = make(chan TracedEvent, 1000)
+		obs.trackingQueue = make(chan int, 1000)
+		obs.messageCount = 0
+		err := obs.publisher.Open(obs.retryQueue, obs.trackingQueue)
+		if err != nil {
+			return err
+		}
+
+		obs.dispatch = dispatch
+		obs.eventQueue = make(chan TracedEvent, 1000)
+
+		obs.processingWg.Add(3)
+		go func() {
+			obs.processQueue()
+			obs.processingWg.Done()
+		}()
+		go func() {
+			obs.processRetryQueue()
+			obs.processingWg.Done()
+		}()
+		go func() {
+			obs.processTrackingQueue()
+			obs.processingWg.Done()
+		}()
+
+		obs.dispatch.Subscribe(obs.key, obs)
+	} else {
+		err = fmt.Errorf("already subscribed")
+	}
+	return
 }
 
 func (obs *PublishObserver) Unsubscribe() {
-  obs.dispatch.Unsubscribe(obs.key)
+	obs.dispatch.Unsubscribe(obs.key)
 }
 
 func (obs *PublishObserver) OnNext(
@@ -51,7 +78,19 @@ func (obs *PublishObserver) OnNext(
 }
 
 func (obs *PublishObserver) OnCompleted() {
+	obs.lgr.Info("closing publish observer...")
+	if obs.messageCount != 0 {
+		obs.lgr.Info(
+			"waiting for pending messages",
+			zap.Int("pending", obs.messageCount),
+		)
+	}
+	for obs.messageCount != 0 {
+		time.Sleep(100 * time.Millisecond)
+	}
 	close(obs.eventQueue)
+	close(obs.retryQueue)
+	close(obs.trackingQueue)
 	obs.processingWg.Wait()
 	obs.publisher.Close()
 }
@@ -63,42 +102,87 @@ func (obs *PublishObserver) processQueue() {
 	obs.publisher.Close()
 
 	active := true
-	batch := make([]TracedEvent, 0)
+	obs.batch = make([]TracedEvent, 0)
 	evnt := TracedEvent{}
 
 	for active {
 		select {
-		case <-ticker.C:	
-			if len(batch) != 0 {
+		case <-ticker.C:
+			if len(obs.batch) != 0 {
 				ticker.Stop()
-				obs.publisher.PublishBatch(batch)
-				batch = make([]TracedEvent, 0)
+				obs.publisher.PublishBatch(obs.batch)
+				obs.batch = make([]TracedEvent, 0)
 				// ticker.Reset(200 * time.Millisecond)
 			}
 
 		case evnt, active = <-obs.eventQueue:
 			if active {
-				if len(batch) == 0 {
+				if len(obs.batch) == 0 {
 					ticker.Reset(200 * time.Millisecond)
 				}
-				batch = append(batch, evnt)
+				if evnt.Retries == 0 {
+					obs.trackingQueue <- 1
+				}
+				obs.batch = append(obs.batch, evnt)
 			}
 		}
 	}
 	// publish remaining messages
-	if len(batch) != 0 {
-		obs.publisher.PublishBatch(batch)
+	if len(obs.batch) != 0 {
+		obs.publisher.PublishBatch(obs.batch)
+	}
+}
+
+func (obs *PublishObserver) processRetryQueue() {
+	active := true
+	var evnt TracedEvent
+	for active {
+		evnt, active = <-obs.retryQueue
+		if active {
+			if evnt.Retries < obs.optn.MaxPublishRetries {
+				evnt.Retries++
+				obs.eventQueue <- evnt
+			} else {
+				obs.trackingQueue <- -1
+				obs.lgr.Error(
+					"message publishing failed after max retries",
+					zap.Int("retries", evnt.Retries),
+					zap.Any("event", evnt.Event),
+					zap.String("trcprnt", evnt.Traceparent),
+					zap.String("tpart", evnt.Tracepart),
+				)
+			}
+		}
+	}
+}
+
+func (obs *PublishObserver) processTrackingQueue() {
+	active := true
+	var val int
+	for active {
+		val, active = <-obs.trackingQueue
+		if active {
+			obs.messageCount += val
+		}
 	}
 }
 
 func NewPublishObserverAndSubscribe(
 	publisher IBatchPublisher,
 	dispatch *NotificationDispatch,
+	lgr *zap.Logger,
+	optn *PublishObserverOptions,
 ) *PublishObserver {
 	obs := PublishObserver{
 		publisher: publisher,
-		key: "PublishObserver",
+		key:       "PublishObserver",
+		lgr:       lgr,
+		optn:      optn,
+		stopping:  false,
 	}
-	obs.Subscribe(dispatch)
+	err := obs.Subscribe(dispatch)
+	if err != nil {
+		panic(fmt.Errorf("failed to subscribe: %w", err))
+	}
 	return &obs
 }

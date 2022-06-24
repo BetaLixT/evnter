@@ -5,3 +5,7 @@ type RabbitMQBatchPublisherOptions struct {
 	ExchangeType string
 	ServiceName  string
 }
+
+type PublishObserverOptions struct {
+	MaxPublishRetries int
+}
