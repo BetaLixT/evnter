@@ -10,16 +10,36 @@ import (
 )
 
 type RabbitMQBatchPublisher struct {
-	conn     *amqp.Connection
-	ch       *amqp.Channel
-	optn     *RabbitMQBatchPublisherOptions
-	pendings map[uint64]TracedEvent
-	confirms chan amqp.Confirmation
-	confrmwg sync.WaitGroup
-	retrych  chan TracedEvent
-	trachch  chan int
-	closing  bool
-	lgr      *zap.Logger
+	conn         *amqp.Connection
+	ch           *amqp.Channel
+	optn         *RabbitMQBatchPublisherOptions
+	pendingMutex sync.Mutex
+	pendingsRaw  map[uint64]TracedEvent
+	confirms     chan amqp.Confirmation
+	confrmwg     sync.WaitGroup
+	retrych      chan TracedEvent
+	trachch      chan int
+	closing      bool
+	lgr          *zap.Logger
+}
+
+func (b *RabbitMQBatchPublisher)getPending(key uint64) TracedEvent {
+	b.pendingMutex.Lock()
+	v := b.pendingsRaw[key]
+	b.pendingMutex.Unlock()
+	return v
+}
+
+func (b *RabbitMQBatchPublisher)setPending(key uint64, evnt TracedEvent) {
+	b.pendingMutex.Lock()
+  b.pendingsRaw[key] = evnt
+	b.pendingMutex.Unlock()
+}
+
+func (b *RabbitMQBatchPublisher)delPending(key uint64) {
+	b.pendingMutex.Lock()
+  delete(b.pendingsRaw, key)
+	b.pendingMutex.Unlock()
 }
 
 func (b *RabbitMQBatchPublisher) Open(
@@ -51,6 +71,7 @@ func (b *RabbitMQBatchPublisher) Open(
 	}
 
 	// - setting up properties
+	b.ch.NotifyPublish(b.confirms)
 	b.retrych = retrych
 	b.trachch = trackch
 
@@ -73,7 +94,7 @@ func (b *RabbitMQBatchPublisher) PublishBatch(evnts []TracedEvent) error {
 			return fmt.Errorf("error unmarshalling: %w", err)
 		}
 		sqno := b.ch.GetNextPublishSeqNo()
-		b.ch.Publish(
+		err = b.ch.Publish(
 			b.optn.ExchangeName,
 			fmt.Sprintf(
 				"%s.%s.%s",
@@ -88,14 +109,20 @@ func (b *RabbitMQBatchPublisher) PublishBatch(evnts []TracedEvent) error {
 				Body:        []byte(json),
 			},
 		)
-		b.pendings[sqno] = evnt
+		if err != nil {
+			b.lgr.Error("Failed to publish message", zap.Error(err))
+			// TODO handle re connection
+			continue
+		}
+		b.setPending(sqno, evnt)
 	}
 	return nil
 }
 
-func (b *RabbitMQBatchPublisher) Close() { 
+func (b *RabbitMQBatchPublisher) Close() {
 	b.ch.Close()
-	close(b.confirms)
+	// this one is closed by rabbitmq client TIL
+	// close(b.confirms)
 	b.confrmwg.Wait()
 }
 
@@ -107,16 +134,18 @@ func (b *RabbitMQBatchPublisher) confirmHandler() {
 		confirmed, open = <-b.confirms
 		if confirmed.DeliveryTag > 0 {
 			if confirmed.Ack {
+			  // TODO: error handling just incase
+				conf := b.getPending(confirmed.DeliveryTag)	
 				b.lgr.Info(
 					"confirmed notification delivery",
-					zap.String("trcprnt", b.pendings[confirmed.DeliveryTag].Traceparent),
-					zap.String("tpart", b.pendings[confirmed.DeliveryTag].Tracepart),
+					zap.String("trcprnt", conf.Traceparent),
+					zap.String("tpart", conf.Tracepart),
 				)
-				go func () {
+				go func() {
 					b.trachch <- -1
 				}()
 			} else {
-				failed := b.pendings[confirmed.DeliveryTag]
+				failed := b.getPending(confirmed.DeliveryTag)
 				b.lgr.Warn(
 					"failed notification delivery",
 					zap.Int("retry", failed.Retries),
@@ -124,18 +153,18 @@ func (b *RabbitMQBatchPublisher) confirmHandler() {
 					zap.String("tpart", failed.Tracepart),
 				)
 				// the channel may be filled
-				go func () {
+				go func() {
 					b.retrych <- failed
 				}()
 			}
-			delete(b.pendings, confirmed.DeliveryTag)
+			b.delPending(confirmed.DeliveryTag)
 		}
-		if len(b.pendings) > 1 {
-			b.lgr.Info(
-				"outstanding confirmations",
-				zap.Int("unconfirmed", len(b.pendings)),
-			)
-		}
+		// if len(b.pendings) > 1 {
+		// 	b.lgr.Info(
+		// 		"outstanding confirmations",
+		// 		zap.Int("unconfirmed", len(b.pendings)),
+		// 	)
+		// }
 	}
 }
 
@@ -149,7 +178,7 @@ func NewRabbitMQBatchPublisher(
 	return &RabbitMQBatchPublisher{
 		conn:     conn,
 		optn:     optn,
-		pendings: map[uint64]TracedEvent{},
+		pendingsRaw: map[uint64]TracedEvent{},
 		confirms: make(chan amqp.Confirmation, 1),
 		closing:  false,
 		lgr:      lgr,

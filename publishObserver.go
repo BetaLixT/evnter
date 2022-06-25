@@ -65,19 +65,26 @@ func (obs *PublishObserver) Unsubscribe() {
 	obs.dispatch.Unsubscribe(obs.key)
 }
 
-func (obs *PublishObserver) OnNext(
+func (obs *PublishObserver) OnNext (
 	evnt EventEntity,
 	traceparent string,
 	tracepart string,
-) {
+) error {
+
+	if obs.stopping {
+		return fmt.Errorf("service is closed")
+	}
+	obs.trackingQueue <- 1			
 	obs.eventQueue <- TracedEvent{
 		Event:       evnt,
 		Traceparent: traceparent,
 		Tracepart:   tracepart,
 	}
+	return nil
 }
 
 func (obs *PublishObserver) OnCompleted() {
+	obs.stopping = true
 	obs.lgr.Info("closing publish observer...")
 	if obs.messageCount != 0 {
 		obs.lgr.Info(
@@ -99,7 +106,6 @@ func (obs *PublishObserver) processQueue() {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	ticker.Stop()
 	defer ticker.Stop()
-	obs.publisher.Close()
 
 	active := true
 	obs.batch = make([]TracedEvent, 0)
@@ -119,9 +125,6 @@ func (obs *PublishObserver) processQueue() {
 			if active {
 				if len(obs.batch) == 0 {
 					ticker.Reset(200 * time.Millisecond)
-				}
-				if evnt.Retries == 0 {
-					obs.trackingQueue <- 1
 				}
 				obs.batch = append(obs.batch, evnt)
 			}

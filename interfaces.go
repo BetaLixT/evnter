@@ -5,7 +5,7 @@ type INotificationObserver interface {
     evnt EventEntity,
     traceparent string,
     tracepartition string,
-  )
+  ) error
   OnCompleted()
 }
 
