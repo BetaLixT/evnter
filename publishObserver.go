@@ -92,8 +92,18 @@ func (obs *PublishObserver) OnCompleted() {
 			zap.Int("pending", obs.messageCount),
 		)
 	}
-	for obs.messageCount != 0 {
+	prevCount := obs.messageCount
+	sameCountRetr := 0
+	// TODO maybe lock required since read writes on messageCount may happen
+	// at the same time
+	for obs.messageCount != 0 && sameCountRetr < 10 {
 		time.Sleep(100 * time.Millisecond)
+		if prevCount == obs.messageCount {
+			sameCountRetr++
+		} else {
+			sameCountRetr = 0
+			prevCount = obs.messageCount
+		}
 	}
 	close(obs.eventQueue)
 	close(obs.retryQueue)

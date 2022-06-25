@@ -94,6 +94,7 @@ func (b *RabbitMQBatchPublisher) PublishBatch(evnts []TracedEvent) error {
 			return fmt.Errorf("error unmarshalling: %w", err)
 		}
 		sqno := b.ch.GetNextPublishSeqNo()
+		// TODO implement tracepart
 		err = b.ch.Publish(
 			b.optn.ExchangeName,
 			fmt.Sprintf(
@@ -107,6 +108,9 @@ func (b *RabbitMQBatchPublisher) PublishBatch(evnts []TracedEvent) error {
 			amqp.Publishing{
 				ContentType: "application/json",
 				Body:        []byte(json),
+				Headers:     amqp.Table{
+					"traceparent": evnt.Traceparent,
+				},
 			},
 		)
 		if err != nil {
