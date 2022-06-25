@@ -13,7 +13,7 @@ func (disp *NotificationDispatch) Subscribe(
 	_, exists := disp.observers[key]
 	if !exists {
 		disp.observers[key] = obs
-		
+
 	}
 }
 
@@ -29,6 +29,7 @@ func (disp *NotificationDispatch) DispatchEventNotification(
 	eventId string,
 	stream string,
 	streamId string,
+	event string,
 	version int,
 	data interface{},
 	createdDateTime time.Time,
@@ -41,6 +42,7 @@ func (disp *NotificationDispatch) DispatchEventNotification(
 				Id:              eventId,
 				Stream:          stream,
 				StreamId:        streamId,
+				Event:           event,
 				StreamVersion:   version,
 				Data:            data,
 				CreatedDateTime: createdDateTime,
@@ -53,7 +55,7 @@ func (disp *NotificationDispatch) DispatchEventNotification(
 
 func (disp *NotificationDispatch) Close() {
 	for _, obs := range disp.observers {
-		obs.OnCompleted();
+		obs.OnCompleted()
 	}
 }
 
