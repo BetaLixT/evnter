@@ -1,4 +1,4 @@
-module techunicorn.com/UDC/streamNotif
+module github.com/BetaLixT/evnter
 
 go 1.18
 
